@@ -1,0 +1,86 @@
+# Build used by the zJu4nn Hub "Mashups" tab.
+# Compiles from this fork's source: hn_gfx (the UE4SS C++ mod, MSVC + MinHook), hn_bridge.exe (MSVC) and the
+# Fabric mod (Gradle on JDK 25), and packs them with the UE4SS build vendored in this repository (MIT) in the
+# folder layout of Hello Neighbor. The Hub installs it and starts bridge -> Minecraft -> Hello Neighbor.
+# Upstream: https://github.com/AvanindraPatil/HelloCraft (MIT) — all credit to AvanindraPatil.
+name: build-hub
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. hub-v1.0.0-1)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: hn_gfx.dll + hn_bridge.exe (MSVC)
+        shell: cmd
+        run: |
+          call native\hn_gfx\build.bat || exit /b 1
+          call protocol\build_bridge.bat "%CD%\obj" || exit /b 1
+
+      - name: Fabric mod
+        shell: pwsh
+        run: |
+          $env:GRADLE_USER_HOME = Join-Path (Get-Location) '.tools\gradle-home'
+          .\fabric-mod\gradlew.bat -p .\fabric-mod --no-daemon --no-configuration-cache build -x test
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ver = ((Get-Content fabric-mod/gradle.properties) | Where-Object { $_ -match '^version=' }) -replace 'version=', ''
+          $jar = Get-ChildItem fabric-mod/build/libs -Filter '*.jar' | Where-Object { $_.Name -notmatch 'sources|dev' } | Select-Object -First 1
+          if (!$jar) { throw 'mod jar not found' }
+          $p = 'pkg'
+          $w = "$p/HelloNeighbor/Binaries/Win64"
+          New-Item -ItemType Directory $w, "$p/mods" -Force | Out-Null
+          Copy-Item native/third_party/ue4ss/dwmapi.dll "$w/dwmapi.dll"
+          Copy-Item native/third_party/ue4ss/ue4ss "$w/ue4ss" -Recurse
+          New-Item -ItemType Directory "$w/ue4ss/Mods/HnGfx/dlls", "$w/ue4ss/Mods/HnLink/Scripts" -Force | Out-Null
+          Copy-Item native/hn_gfx/build/hn_gfx.dll "$w/ue4ss/Mods/HnGfx/dlls/main.dll"
+          Copy-Item ue4ss-mods/HnLink/Scripts/main.lua "$w/ue4ss/Mods/HnLink/Scripts/main.lua"
+          # mods.txt: the UE4SS defaults (BPModLoaderMod off: it fails on this game) plus the two HelloCraft mods
+          @('CheatManagerEnablerMod : 1','ConsoleCommandsMod : 1','ConsoleEnablerMod : 1','BPML_GenericFunctions : 1','BPModLoaderMod : 0','HnLink : 1','HnGfx : 1','','; Built-in keybinds, do not move up!','Keybinds : 1') | Set-Content "$w/ue4ss/Mods/mods.txt" -Encoding ascii
+          Copy-Item obj/hn_bridge.exe "$p/hn_bridge.exe"
+          Copy-Item $jar.FullName "$p/mods/$($jar.Name)"
+          Copy-Item LICENSE "$p/LICENSE.txt"
+          Copy-Item native/third_party/minhook/LICENSE.txt "$p/LICENSE-MinHook.txt"
+          Copy-Item native/third_party/ue4ss/VERSION.txt "$p/UE4SS-VERSION.txt"
+          @(
+            "HelloCraft $ver (build do zJu4nn Hub)",
+            '',
+            'Hello Neighbor jogado como um jogador de Minecraft. Original de AvanindraPatil',
+            '(github.com/AvanindraPatil/HelloCraft). Licenca MIT. UE4SS (MIT) e MinHook (BSD-2) inclusos.',
+            'Projeto de fas, sem ligacao com tinyBuild, Dynamic Pixels, Mojang ou Microsoft.'
+          ) | Set-Content "$p/LEIA.txt" -Encoding utf8
+          $base = (Resolve-Path $p).Path
+          $sums = Get-ChildItem $p -Recurse -File | ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.FullName.Substring($base.Length + 1).Replace('\','/'))" }
+          $sums | Set-Content "$p/SHA256SUMS.txt" -Encoding ascii
+          $sums
+          Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+          $zip = "hellocraft-hub-$ver.zip"
+          $z = [System.IO.Compression.ZipFile]::Open((Join-Path (Get-Location) $zip), 'Create')
+          try { Get-ChildItem $p -Recurse -File | ForEach-Object { [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($z, $_.FullName, $_.FullName.Substring($base.Length + 1).Replace('\','/'), 'Optimal') | Out-Null } } finally { $z.Dispose() }
+          "ZIP=$zip" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "VER=$ver" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          Get-FileHash $zip -Algorithm SHA256 | Format-List
+
+      - name: Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ inputs.tag }}" $env:ZIP --repo "${{ github.repository }}" --title "HelloCraft $env:VER (zJu4nn Hub)" --notes "Build of AvanindraPatil/HelloCraft $env:VER for the zJu4nn Hub Mashups tab, compiled from this fork at ${{ github.sha }} (UE4SS vendored by upstream, MIT). MIT."
